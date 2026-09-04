@@ -1,0 +1,16 @@
+# 資料庫本身有版權，不進版控（見 README「版權聲明」）
+*.db
+*.db.[0-9][0-9][0-9]
+bible.db
+bible_merged.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 編輯器 / 系統雜項
+.DS_Store
+.idea/
+.vscode/
