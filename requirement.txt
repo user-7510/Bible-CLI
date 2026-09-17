@@ -1,0 +1,8 @@
+# bible.py 僅使用 Python 標準函式庫（argparse, ctypes, io, locale, os, re,
+# sqlite3, subprocess, sys, unicodedata, html.parser, curses）。
+# 在 Linux / macOS / Termux 上不需要安裝任何第三方套件。
+#
+# Windows 未內建 curses 模組，僅在啟動 TUI（不帶子指令執行）時才需要下列套件；
+# CLI 子指令（list/read/search/intro/note/orig/strong）在 Windows 上不需要它。
+windows-curses; sys_platform == "win32"
+

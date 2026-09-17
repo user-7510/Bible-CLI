@@ -31,7 +31,7 @@
 
 執行目錄下若同時偵測到恢復本資料庫（`bible.db`）與 Strong 原文模組（`.mybible`），互動式 TUI 會直接以恢復本畫面開啟，可在**任一畫面**按 `s` 切換到原文 Strong 畫面、按 `r` 切回恢復本（搜尋輸入畫面除外），兩種畫面共用同一個 TUI session，切換時不會有畫面重啟或閃爍。詳見〈[原文 Strong 畫面](#原文-strong-畫面)〉。
 
-僅依賴 Python 標準函式庫，於 Linux、macOS、Termux 等環境下皆可直接執行，無需額外安裝套件；Windows 則需額外安裝一個套件才能使用 TUI，詳見〈[Windows 使用說明](#windows-使用說明)〉。
+僅依賴 Python 標準函式庫，於 Linux、macOS、Termux 等環境下皆可直接執行，無需額外安裝套件；Windows 則需額外安裝一個套件才能使用 TUI，詳見〈[Windows 使用說明](#windows-使用說明)〉。TUI 中另提供一鍵複製經文／註解到系統剪貼簿的功能（`y` 鍵，展開註解時亦會自動複製），此功能需另外安裝對應平台的命令列剪貼簿工具，詳見〈[系統需求](#系統需求)〉。
 
 ## 版權聲明
 
@@ -50,6 +50,15 @@ App 內建資料庫（含恢復本聖經正文、註解、大綱）之版權屬�
 - Linux／macOS／Termux：`curses` 為標準函式庫內建，無需額外安裝
 - Windows：需另外安裝 `windows-curses` 才能使用 TUI（CLI 指令則不需要，見下方說明）
 - 原文 Strong 對照功能為選用功能，僅需額外準備 `.mybible` 檔案，無需安裝額外 Python 套件
+- 剪貼簿複製功能（TUI 中的 `y` 鍵、展開註解時自動複製）為選用功能，未安裝對應工具時該功能會直接顯示複製失敗訊息，不影響其餘功能；依平台安裝對應的命令列剪貼簿工具：
+
+  | 平台 | 命令列剪貼簿工具 | 安裝指令 |
+  | --- | --- | --- |
+  | macOS | `pbcopy`（系統內建） | 不需安裝 |
+  | Linux（X11） | `xclip` 或 `xsel` | `sudo apt install xclip`（Debian／Ubuntu）或 `sudo dnf install xclip`（Fedora） |
+  | Linux（Wayland） | `wl-clipboard`（提供 `wl-copy`） | `sudo apt install wl-clipboard`（Debian／Ubuntu）或 `sudo dnf install wl-clipboard`（Fedora） |
+  | Termux | `termux-api`（提供 `termux-clipboard-set`） | `pkg install termux-api`（並另外安裝 Termux:API App） |
+  | Windows | `clip`（系統內建） | 不需安裝 |
 
 ## 安裝
 
@@ -126,6 +135,7 @@ export BIBLE_STRONG_BIBLE=/path/to/cuvt_bbl.mybible
 | 點擊某節經文 | 展開／收合該節註解（恢復本畫面） |
 | `s` | 切換到原文 Strong 畫面（任一畫面皆可按，需偵測到 `.mybible` 模組） |
 | `r` | 切回恢復本畫面（任一畫面皆可按，需偵測到 `bible.db`） |
+| `y` | 複製目前畫面附近該節經文到剪貼簿（讀經畫面；展開註解時會自動複製註解內容） |
 | `/` | 全文搜尋（恢復本畫面） |
 | `q` / `Backspace` | 返回上一層 |
 | `?` | 開啟操作說明 |
@@ -246,3 +256,4 @@ bible strong <G26|H157> [--dict PATH] [--no-color]
 ## AI輔助揭露
 
 - 本專案之部分函式為AI協作。
+

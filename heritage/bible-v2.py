@@ -40,7 +40,6 @@ import locale
 import os
 import re
 import sqlite3
-import subprocess
 import sys
 import unicodedata
 from html.parser import HTMLParser
@@ -210,39 +209,6 @@ def supportsAnsiColor():
         return sys.stdout.isatty()
     except Exception:
         return False
-
-
-def copyToClipboardText(text):
-    """嘗試呼叫各平台常見的剪貼簿指令，把 text 複製進系統剪貼簿。
-    依序嘗試 Termux / Linux（X11、Wayland）/ macOS / Windows 常見工具，
-    只要有一個成功即回傳 True；全部失敗（例如指令未安裝）則回傳 False，
-    不會因此中斷程式。"""
-    if not text:
-        return False
-    if isWindows:
-        candidates = [["clip"]]
-    elif sys.platform == "darwin":
-        candidates = [["pbcopy"]]
-    else:
-        candidates = [
-            ["termux-clipboard-set"],
-            ["wl-copy"],
-            ["xclip", "-selection", "clipboard"],
-            ["xsel", "--clipboard", "--input"],
-        ]
-    payload = text.encode("utf-8", errors="replace")
-    for cmd in candidates:
-        try:
-            proc = subprocess.run(
-                cmd, input=payload,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=3,
-            )
-        except (FileNotFoundError, OSError, subprocess.SubprocessError):
-            continue
-        if proc.returncode == 0:
-            return True
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -886,69 +852,20 @@ def cwidth(ch):
     return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
 
-def _isWordChar(ch):
-    """判斷是否屬於「英文單字」的組成字元（字母、數字、撇號、連字號）。
-    這類字元連續出現時視為一個不可截斷的單字，換行時整個一起移到下一行，
-    避免英文單字被硬生生切成兩截。"""
-    return ch.isascii() and (ch.isalnum() or ch in ("'", "-"))
-
-
 def wrapMarked(chars, width):
-    """把 (字元, 標記) 的清單依畫面寬度換行，回傳每行的 (字元, 標記) 清單。
-    連續的英數字元（視為一個英文單字）不會被拆到兩行：
-    - 整個單字放得下目前這行剩餘寬度 -> 直接接在後面
-    - 放不下但單字本身不超過整行寬度 -> 換行後整個放到下一行開頭
-    - 單字本身就比整行寬度還長（極端狀況）-> 才逐字元硬拆
-    非英數字元（含中文、標點、空白）的斷行邏輯與原本相同。"""
     lines = []
     cur = []
     curw = 0
-    pending = []
-    pendw = 0
-
-    def flushPending():
-        nonlocal cur, curw, pending, pendw
-        if not pending:
-            return
-        if curw + pendw <= width:
-            cur.extend(pending)
-            curw += pendw
-        elif pendw <= width:
-            lines.append(cur)
-            cur = list(pending)
-            curw = pendw
-        else:
-            for pc, pflag in pending:
-                pw = cwidth(pc)
-                if curw + pw > width:
-                    lines.append(cur)
-                    cur = []
-                    curw = 0
-                cur.append((pc, pflag))
-                curw += pw
-        pending = []
-        pendw = 0
-
     for ch, flag in chars:
-        if ch == "\n":
-            flushPending()
-            lines.append(cur)
-            cur = []
-            curw = 0
-            continue
-        if _isWordChar(ch):
-            pending.append((ch, flag))
-            pendw += cwidth(ch)
-            continue
-        flushPending()
         w = cwidth(ch)
-        if curw + w > width:
+        if ch == "\n" or curw + w > width:
             lines.append(cur)
             cur = []
             curw = 0
+            if ch == "\n":
+                continue
         cur.append((ch, flag))
         curw += w
-    flushPending()
     lines.append(cur)
     return lines
 
@@ -993,9 +910,6 @@ class App:
 
         self.mode = initialMode
         self.modeStack = []
-        self.history = []
-        self._quitPromptFrom = None
-        self.statusMessage = None
 
         self.books = self._loadBooks() if self.hasDb else []
         self.bookIdx = 0
@@ -1056,131 +970,6 @@ class App:
         ).fetchone()
         return row["m"] or 1
 
-    # -----------------------------------------------------------------
-    # 分頁捲動（PageUp / PageDown / Space，類似 w3m 整頁捲動）
-    # -----------------------------------------------------------------
-
-    def _pageStep(self):
-        """一頁要捲動的行／項目數：畫面可視高度扣掉一行，
-        保留一行重疊做為上下文參考（w3m 風格），至少捲動 1。"""
-        h, _w = self.stdscr.getmaxyx()
-        return max(1, (h - 2) - 1)
-
-    # -----------------------------------------------------------------
-    # 上一頁歷史紀錄（b / B 返回上一頁）
-    # -----------------------------------------------------------------
-
-    _NAV_KEYS = (
-        "mode",
-        "bookIdx", "bookScroll",
-        "selectedBookIndex", "chapterCount", "chapterIdx", "chapterScroll",
-        "selectedChapter", "showEn", "showCuv", "showOutline",
-        "expanded", "readScroll",
-        "searchQuery", "searchResults", "searchScroll", "searchIdx",
-        "strongBookIdx", "strongBookScroll",
-        "strongSelectedBookIndex", "strongChapterCount",
-        "strongChapterIdx", "strongChapterScroll", "strongSelectedChapter",
-        "expandedStrongWords", "strongReadScroll",
-    )
-
-    def _snapshot(self):
-        snap = {}
-        for key in self._NAV_KEYS:
-            val = getattr(self, key)
-            if isinstance(val, set):
-                val = set(val)
-            elif isinstance(val, list):
-                val = list(val)
-            snap[key] = val
-        return snap
-
-    def _pushHistory(self):
-        self.history.append(self._snapshot())
-
-    def _goBack(self):
-        """回到上一頁：還原上一次 _pushHistory() 當下的完整畫面狀態。
-        沒有上一頁紀錄時（已回到最初畫面）不做任何事。"""
-        if not self.history:
-            return False
-        snap = self.history.pop()
-        for key, val in snap.items():
-            setattr(self, key, val)
-        self._readCacheKey = None
-        self._strongReadCacheKey = None
-        return True
-
-    # -----------------------------------------------------------------
-    # 複製經文／註解到剪貼簿
-    # -----------------------------------------------------------------
-
-    def _copyToClipboard(self, text):
-        return copyToClipboardText(text)
-
-    def _currentReadSection(self):
-        """目前畫面上（捲動位置附近）所在的節，供複製整節、Enter 展開註解使用。
-        優先找畫面頂端（readScroll）之後最近的一節，找不到再往前找。"""
-        for line in self.readLines[self.readScroll:]:
-            if line.section is not None:
-                return line.section
-        for line in self.readLines[:self.readScroll]:
-            if line.section is not None:
-                return line.section
-        return None
-
-    def _footnoteText(self, section):
-        langPrimary = "cuv_big5" if self.showCuv else "big5"
-        fn = getFootnotes(
-            self.conn, langPrimary, self.selectedBookIndex, self.selectedChapter, section
-        )
-        notes = [f["note"] for f in fn if f["note"]]
-        return "\n".join(notes)
-
-    def _toggleExpandSection(self, section):
-        """展開／收合某一節的註解；展開時（非收合）若該節有註解，
-        自動把註解內容複製到剪貼簿。"""
-        if section in self.expanded:
-            self.expanded.discard(section)
-            return
-        self.expanded.add(section)
-        text = self._footnoteText(section)
-        if not text:
-            return
-        if self._copyToClipboard(text):
-            self.statusMessage = "已複製註解到剪貼簿"
-        else:
-            self.statusMessage = "找不到可用的剪貼簿工具，複製失敗"
-
-    def _copyCurrentVerse(self):
-        section = self._currentReadSection()
-        if section is None:
-            self.statusMessage = "目前沒有可複製的經節"
-            return
-        langPrimary = "cuv_big5" if self.showCuv else "big5"
-        cur = self.conn.cursor()
-        row = cur.execute(
-            "SELECT content FROM content WHERE language=? AND book_index=? "
-            "AND chapter=? AND section=?",
-            (langPrimary, self.selectedBookIndex, self.selectedChapter, section),
-        ).fetchone()
-        if not row:
-            self.statusMessage = "查無經文內容"
-            return
-        bookName = bookDisplayName(self.conn, self.selectedBookIndex, "big5")
-        text = f"{bookName} {self.selectedChapter}:{section}　{row['content']}"
-        if self._copyToClipboard(text):
-            self.statusMessage = f"已複製 {bookName} {self.selectedChapter}:{section}"
-        else:
-            self.statusMessage = "找不到可用的剪貼簿工具，複製失敗"
-
-    def _openSearch(self):
-        """開啟搜尋：若已有上一次的搜尋字詞與結果，直接顯示上次的搜尋結果，
-        方便重複查詢；否則進入搜尋輸入畫面（預設字詞沿用上次輸入，若無則為空）。"""
-        self._pushHistory()
-        if self.searchQuery and self.searchResults:
-            self.mode = "search_results"
-        else:
-            self.mode = "search_input"
-
     def run(self):
         curses = self.curses
         curses.curs_set(0)
@@ -1215,39 +1004,26 @@ class App:
     def draw(self):
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
-        drawMode = self._quitPromptFrom if self.mode == "confirm_quit" else self.mode
-        if drawMode == "books":
+        if self.mode == "books":
             self.drawBooks(h, w)
-        elif drawMode == "chapters":
+        elif self.mode == "chapters":
             self.drawChapters(h, w)
-        elif drawMode == "read":
+        elif self.mode == "read":
             self.drawRead(h, w)
-        elif drawMode == "search_input":
+        elif self.mode == "search_input":
             self.drawSearchInput(h, w)
-        elif drawMode == "search_results":
+        elif self.mode == "search_results":
             self.drawSearchResults(h, w)
-        elif drawMode == "strong_books":
+        elif self.mode == "strong_books":
             self.drawStrongBooks(h, w)
-        elif drawMode == "strong_chapters":
+        elif self.mode == "strong_chapters":
             self.drawStrongChapters(h, w)
-        elif drawMode == "strong_read":
+        elif self.mode == "strong_read":
             self.drawStrongRead(h, w)
-        elif drawMode == "help":
+        elif self.mode == "help":
             self.drawHelp(h, w)
-        if self.mode == "confirm_quit":
-            self._drawQuitPrompt(h, w)
         self.drawStatus(h, w)
         self.stdscr.refresh()
-
-    def _drawQuitPrompt(self, h, w):
-        curses = self.curses
-        text = " 確定要離開程式嗎？(y/n) "
-        y = h // 2
-        x = max(0, (w - len(text)) // 2)
-        try:
-            self.stdscr.addstr(y, x, text[: max(0, w - 1)], curses.color_pair(colorHeader) | curses.A_BOLD)
-        except curses.error:
-            pass
 
     def _statusText(self):
         base = "按 ? 查看說明"
@@ -1261,7 +1037,7 @@ class App:
 
     def drawStatus(self, h, w):
         curses = self.curses
-        text = (self.statusMessage or self._statusText())[: max(0, w - 1)]
+        text = self._statusText()[: max(0, w - 1)]
         try:
             self.stdscr.addstr(h - 1, 0, text.ljust(w - 1), curses.color_pair(colorHelp))
         except curses.error:
@@ -1662,18 +1438,13 @@ class App:
             self.strongBookIdx = max(0, self.strongBookIdx - 1)
         elif ch in (curses.KEY_DOWN, ord("j")):
             self.strongBookIdx = min(n - 1, self.strongBookIdx + 1)
-        elif ch == curses.KEY_NPAGE or ch == ord(" "):
-            self.strongBookIdx = min(n - 1, self.strongBookIdx + self._pageStep())
-        elif ch == curses.KEY_PPAGE:
-            self.strongBookIdx = max(0, self.strongBookIdx - self._pageStep())
         elif ch in (10, 13, curses.KEY_ENTER):
             self._enterStrongBook()
-        elif ch in (27, curses.KEY_BACKSPACE, 127, 8):
-            self._goBack()
+        elif ch in (ord("q"), 27):
+            return False
         return True
 
     def _enterStrongBook(self):
-        self._pushHistory()
         self.strongSelectedBookIndex = self.strongBooks[self.strongBookIdx][0]
         self.strongChapterCount = self._strongMaxChapter(self.strongSelectedBookIndex)
         self.strongChapterIdx = 0
@@ -1691,20 +1462,13 @@ class App:
             self.strongChapterIdx = max(0, self.strongChapterIdx - 1)
         elif ch in (curses.KEY_RIGHT, ord("l")):
             self.strongChapterIdx = min(self.strongChapterCount - 1, self.strongChapterIdx + 1)
-        elif ch == curses.KEY_NPAGE or ch == ord(" "):
-            self.strongChapterIdx = min(
-                self.strongChapterCount - 1, self.strongChapterIdx + self._pageStep() * cols
-            )
-        elif ch == curses.KEY_PPAGE:
-            self.strongChapterIdx = max(0, self.strongChapterIdx - self._pageStep() * cols)
         elif ch in (10, 13, curses.KEY_ENTER):
             self._enterStrongChapter()
-        elif ch in (27, curses.KEY_BACKSPACE, 127, 8):
-            self._goBack()
+        elif ch in (ord("q"), 27, curses.KEY_BACKSPACE, 127, 8):
+            self.mode = "strong_books"
         return True
 
     def _enterStrongChapter(self):
-        self._pushHistory()
         self.strongSelectedChapter = self.strongChapterIdx + 1
         self.strongReadScroll = 0
         self.expandedStrongWords = set()
@@ -1716,10 +1480,10 @@ class App:
             self.strongReadScroll = max(0, self.strongReadScroll - 1)
         elif ch in (curses.KEY_DOWN, ord("j")):
             self.strongReadScroll += 1
-        elif ch == curses.KEY_NPAGE or ch == ord(" "):
-            self.strongReadScroll += self._pageStep()
+        elif ch == curses.KEY_NPAGE:
+            self.strongReadScroll += 10
         elif ch == curses.KEY_PPAGE:
-            self.strongReadScroll = max(0, self.strongReadScroll - self._pageStep())
+            self.strongReadScroll = max(0, self.strongReadScroll - 10)
         elif ch in (curses.KEY_LEFT, ord("h")):
             if self.strongSelectedChapter > 1:
                 self.strongSelectedChapter -= 1
@@ -1730,8 +1494,8 @@ class App:
                 self.strongSelectedChapter += 1
                 self.strongReadScroll = 0
                 self.expandedStrongWords = set()
-        elif ch in (27, curses.KEY_BACKSPACE, 127, 8):
-            self._goBack()
+        elif ch in (ord("q"), 27, curses.KEY_BACKSPACE, 127, 8):
+            self.mode = "strong_chapters"
         return True
 
     def drawHelp(self, h, w):
@@ -1739,23 +1503,17 @@ class App:
         lines = [
             "書卷清單／章節清單／搜尋結果：",
             "  ↑↓ 或 j k 移動，Enter 或滑鼠左鍵點擊 選取",
-            "  PageUp/PageDown 或 Space  整頁上下捲動（類似 w3m）",
             "",
             "讀經畫面：",
             "  ↑↓ 或 j k 捲動內文，←→ 切換上下章",
-            "  PageUp/PageDown 或 Space  整頁上下捲動（類似 w3m）",
             "  e   切換是否顯示英文對照",
             "  c   切換恢復本／和合本正文",
             "  n   切換是否顯示大綱",
-            "  滑鼠點擊某節經文 / Enter 對準該節  展開或收合該節註解",
-            "        （展開註解時會自動複製註解內容到剪貼簿）",
-            "  y   複製目前（畫面頂端附近）該節經文到剪貼簿",
+            "  滑鼠點擊某節經文 / Enter 對準該節  可展開或收合該節註解",
             "",
             "共通：",
-            "  /   搜尋全經文（預設字詞為上次搜尋，且直接顯示上次結果）",
-            "  b 或 B   返回上一頁（有完整瀏覽紀錄，可逐頁返回）",
-            "  q   離開程式（會先詢問 y/n 確認）",
-            "  Q   直接離開程式，不詢問",
+            "  /   搜尋全經文",
+            "  q 或 Backspace   返回上一層 / 離開",
         ]
         if self.hasStrongBible:
             lines.append("  s   切換到原文 Strong 畫面（搜尋輸入畫面除外，任何畫面皆可按）")
@@ -1777,7 +1535,6 @@ class App:
         curses = self.curses
         if isinstance(ch, str):
             ch = ord(ch)
-        self.statusMessage = None
 
         if ch == curses.KEY_MOUSE:
             try:
@@ -1785,14 +1542,6 @@ class App:
             except curses.error:
                 return True
             self._handleMouse(my, mx, bstate)
-            return True
-
-        if self.mode == "confirm_quit":
-            if ch in (ord("y"), ord("Y")):
-                return False
-            if ch in (ord("n"), ord("N"), 27):
-                self.mode = self._quitPromptFrom
-                self._quitPromptFrom = None
             return True
 
         if ch in (ord("?"),) and self.mode != "help":
@@ -1803,25 +1552,11 @@ class App:
             self.mode = self.modeStack.pop() if self.modeStack else "books"
             return True
 
-        if ch == ord("Q") and self.mode != "search_input":
-            # 直接離開程式，不詢問
-            return False
-        if ch == ord("q") and self.mode != "search_input":
-            # 先詢問 y/n 再離開
-            self._quitPromptFrom = self.mode
-            self.mode = "confirm_quit"
-            return True
-        if ch in (ord("b"), ord("B")) and self.mode != "search_input":
-            self._goBack()
-            return True
-
         if self.mode != "search_input":
             if ch in (ord("s"), ord("S")) and self.hasStrongBible and not self.mode.startswith("strong"):
-                self._pushHistory()
                 self.mode = "strong_books"
                 return True
             if ch in (ord("r"), ord("R")) and self.hasDb and self.mode.startswith("strong"):
-                self._pushHistory()
                 self.mode = "books"
                 return True
 
@@ -1868,7 +1603,10 @@ class App:
         elif self.mode == "read":
             section = self.clickMapRead.get(y)
             if section is not None:
-                self._toggleExpandSection(section)
+                if section in self.expanded:
+                    self.expanded.discard(section)
+                else:
+                    self.expanded.add(section)
         elif self.mode == "search_results":
             item = self.clickMap.get(y)
             if item and item[0] == "search_result":
@@ -1918,20 +1656,17 @@ class App:
             self.bookIdx = max(0, self.bookIdx - 1)
         elif ch in (curses.KEY_DOWN, ord("j")):
             self.bookIdx = min(len(self.books) - 1, self.bookIdx + 1)
-        elif ch == curses.KEY_NPAGE or ch == ord(" "):
-            self.bookIdx = min(len(self.books) - 1, self.bookIdx + self._pageStep())
-        elif ch == curses.KEY_PPAGE:
-            self.bookIdx = max(0, self.bookIdx - self._pageStep())
         elif ch in (10, 13, curses.KEY_ENTER):
             self._enterBook()
         elif ch == ord("/"):
-            self._openSearch()
-        elif ch == 27:
-            self._goBack()
+            self.modeStack.append(self.mode)
+            self.searchQuery = ""
+            self.mode = "search_input"
+        elif ch in (ord("q"), 27):
+            return False
         return True
 
     def _enterBook(self):
-        self._pushHistory()
         self.selectedBookIndex = self.books[self.bookIdx][0]
         self.chapterCount = self._maxChapter(self.selectedBookIndex)
         self.chapterIdx = 0
@@ -1949,18 +1684,13 @@ class App:
             self.chapterIdx = max(0, self.chapterIdx - 1)
         elif ch in (curses.KEY_RIGHT, ord("l")):
             self.chapterIdx = min(self.chapterCount - 1, self.chapterIdx + 1)
-        elif ch == curses.KEY_NPAGE or ch == ord(" "):
-            self.chapterIdx = min(self.chapterCount - 1, self.chapterIdx + self._pageStep() * cols)
-        elif ch == curses.KEY_PPAGE:
-            self.chapterIdx = max(0, self.chapterIdx - self._pageStep() * cols)
         elif ch in (10, 13, curses.KEY_ENTER):
             self._enterChapter()
-        elif ch in (27, curses.KEY_BACKSPACE, 127, 8):
-            self._goBack()
+        elif ch in (ord("q"), 27, curses.KEY_BACKSPACE, 127, 8):
+            self.mode = "books"
         return True
 
     def _enterChapter(self):
-        self._pushHistory()
         self.selectedChapter = self.chapterIdx + 1
         self.readScroll = 0
         self.expanded = set()
@@ -1972,10 +1702,10 @@ class App:
             self.readScroll = max(0, self.readScroll - 1)
         elif ch in (curses.KEY_DOWN, ord("j")):
             self.readScroll += 1
-        elif ch == curses.KEY_NPAGE or ch == ord(" "):
-            self.readScroll += self._pageStep()
+        elif ch == curses.KEY_NPAGE:
+            self.readScroll += 10
         elif ch == curses.KEY_PPAGE:
-            self.readScroll = max(0, self.readScroll - self._pageStep())
+            self.readScroll = max(0, self.readScroll - 10)
         elif ch in (curses.KEY_LEFT, ord("h")):
             if self.selectedChapter > 1:
                 self.selectedChapter -= 1
@@ -1992,16 +1722,12 @@ class App:
             self.showCuv = not self.showCuv
         elif ch == ord("n"):
             self.showOutline = not self.showOutline
-        elif ch in (10, 13, curses.KEY_ENTER):
-            section = self._currentReadSection()
-            if section is not None:
-                self._toggleExpandSection(section)
-        elif ch in (ord("y"), ord("Y")):
-            self._copyCurrentVerse()
         elif ch == ord("/"):
-            self._openSearch()
-        elif ch in (27, curses.KEY_BACKSPACE, 127, 8):
-            self._goBack()
+            self.modeStack.append(self.mode)
+            self.searchQuery = ""
+            self.mode = "search_input"
+        elif ch in (ord("q"), 27, curses.KEY_BACKSPACE, 127, 8):
+            self.mode = "chapters"
         return True
 
     def _keySearchInput(self, ch):
@@ -2010,7 +1736,7 @@ class App:
             self._runSearch()
             self.mode = "search_results"
         elif ch == 27:
-            self._goBack()
+            self.mode = self.modeStack.pop() if self.modeStack else "books"
         elif ch in (curses.KEY_BACKSPACE, 127, 8):
             self.searchQuery = self.searchQuery[:-1]
         elif 32 <= ch < 0x110000:
@@ -2021,11 +1747,10 @@ class App:
         return True
 
     def _runSearch(self):
-        """全文搜尋：不設條數上限，回傳所有符合的經節。"""
         cur = self.conn.cursor()
         rows = cur.execute(
             "SELECT book_index, chapter, section, content FROM content "
-            "WHERE language='big5' AND content LIKE ? ORDER BY book_index, chapter, section",
+            "WHERE language='big5' AND content LIKE ? ORDER BY book_index, chapter, section LIMIT 500",
             (f"%{self.searchQuery}%",),
         ).fetchall()
         results = []
@@ -2053,24 +1778,15 @@ class App:
             self.searchIdx = max(0, self.searchIdx - 1)
         elif ch in (curses.KEY_DOWN, ord("j")):
             self.searchIdx = min(len(self.searchResults) - 1, self.searchIdx + 1)
-        elif ch == curses.KEY_NPAGE or ch == ord(" "):
-            self.searchIdx = min(len(self.searchResults) - 1, self.searchIdx + self._pageStep())
-        elif ch == curses.KEY_PPAGE:
-            self.searchIdx = max(0, self.searchIdx - self._pageStep())
         elif ch in (10, 13, curses.KEY_ENTER):
             self._gotoSearchResult()
-        elif ch == ord("/"):
-            # 重新編輯搜尋字詞（預設沿用目前字詞），可用 b/B 或 Esc 返回目前的搜尋結果
-            self._pushHistory()
-            self.mode = "search_input"
-        elif ch in (27, curses.KEY_BACKSPACE, 127, 8):
-            self._goBack()
+        elif ch in (ord("q"), 27, curses.KEY_BACKSPACE, 127, 8):
+            self.mode = self.modeStack.pop() if self.modeStack else "books"
         return True
 
     def _gotoSearchResult(self):
         if not self.searchResults:
             return
-        self._pushHistory()
         r = self.searchResults[self.searchIdx]
         self.selectedBookIndex = r["book_index"]
         self.chapterCount = self._maxChapter(self.selectedBookIndex)

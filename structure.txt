@@ -1,0 +1,13 @@
+LICENSE
+README.md
+README.pdf
+addPathLinux.sh
+bible
+bible-db-full.tar.gz
+bible.db
+bible.py
+cuvt.bbl.mybible
+heritage/
+requirement.txt
+strong_lite.dct.mybible
+tools/
