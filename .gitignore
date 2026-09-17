@@ -3,7 +3,9 @@
 *.db.[0-9][0-9][0-9]
 bible.db
 bible_merged.db
+*.mybible
 
+*.tar.gz
 # Python
 __pycache__/
 *.pyc
